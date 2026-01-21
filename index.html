@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>PDF → JPEG (ZIP)</title>
+    <style>
+      body {
+        font-family:
+          system-ui,
+          -apple-system,
+          Segoe UI,
+          Roboto,
+          sans-serif;
+        margin: 24px;
+      }
+      .row {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin: 12px 0;
+      }
+      label {
+        display: inline-flex;
+        gap: 8px;
+        align-items: center;
+      }
+      input[type='number'] {
+        width: 90px;
+      }
+      progress {
+        width: 320px;
+        max-width: 100%;
+      }
+      #log {
+        white-space: pre-wrap;
+        background: #f6f6f6;
+        padding: 12px;
+        border-radius: 8px;
+      }
+      button {
+        padding: 8px 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>PDF → JPEGs (download as ZIP)</h1>
+
+    <div class="row">
+      <input id="pdfFile" type="file" accept="application/pdf" />
+      <button id="convertBtn" disabled>Convert & Download ZIP</button>
+    </div>
+
+    <div class="row">
+      <label
+        >Scale (resolution)
+        <input
+          id="scale"
+          type="number"
+          min="0.5"
+          max="5"
+          step="0.25"
+          value="3"
+        />
+      </label>
+
+      <label
+        >JPEG Quality
+        <input
+          id="quality"
+          type="number"
+          min="0.1"
+          max="1"
+          step="0.05"
+          value="1"
+        />
+      </label>
+    </div>
+
+    <div class="row">
+      <progress id="progress" value="0" max="1"></progress>
+      <span id="status">Choose a PDF…</span>
+    </div>
+
+    <div id="log" aria-live="polite"></div>
+
+    <script type="module">
+      const fileInput = document.getElementById('pdfFile');
+      const convertBtn = document.getElementById('convertBtn');
+      const progressEl = document.getElementById('progress');
+      const statusEl = document.getElementById('status');
+      const logEl = document.getElementById('log');
+      const scaleEl = document.getElementById('scale');
+      const qualityEl = document.getElementById('quality');
+
+      const pdfWorkerSrc =
+        'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs';
+
+      let selectedFile = null;
+      let depsReady = false;
+      let pdfjsLib;
+      let JSZip;
+      let saveAs;
+
+      // Load dependencies dynamically so the page still initializes even if the CDN is slow.
+      (async () => {
+        try {
+          statusEl.textContent = 'Loading libraries…';
+          const [pdfMod, zipMod, saverMod] = await Promise.all([
+            import('https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/+esm'),
+            import('https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm'),
+            import('https://cdn.jsdelivr.net/npm/file-saver@2.0.5/+esm'),
+          ]);
+
+          pdfjsLib = pdfMod;
+          JSZip = zipMod.default || zipMod.JSZip || zipMod;
+          saveAs = saverMod.saveAs || saverMod.default;
+          if (typeof saveAs !== 'function') {
+            throw new Error('FileSaver saveAs not available');
+          }
+
+          pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
+          try {
+            pdfjsLib.GlobalWorkerOptions.workerPort = new Worker(pdfWorkerSrc, {
+              type: 'module',
+            });
+          } catch (err) {
+            console.error('Failed to start PDF.js worker', err);
+            statusEl.textContent = 'PDF worker failed to start';
+          }
+
+          depsReady = true;
+          statusEl.textContent = 'Libraries loaded. Choose a PDF…';
+          maybeEnableConvert();
+        } catch (err) {
+          console.error('Failed to load deps', err);
+          statusEl.textContent = 'Failed to load libraries';
+          logEl.textContent = `Failed to load libraries: ${
+            err && err.message ? err.message : String(err)
+          }`;
+          convertBtn.disabled = true;
+        }
+      })();
+
+      fileInput.addEventListener('change', () => {
+        selectedFile =
+          fileInput.files && fileInput.files[0] ? fileInput.files[0] : null;
+        maybeEnableConvert();
+        statusEl.textContent = selectedFile
+          ? `Selected: ${selectedFile.name}`
+          : 'Choose a PDF…';
+        logEl.textContent = '';
+        progressEl.value = 0;
+        progressEl.max = 1;
+      });
+
+      convertBtn.addEventListener('click', async () => {
+        if (!depsReady) {
+          logEl.textContent = 'Libraries not loaded yet.';
+          return;
+        }
+        if (!selectedFile) return;
+
+        convertBtn.disabled = true;
+        fileInput.disabled = true;
+        scaleEl.disabled = true;
+        qualityEl.disabled = true;
+
+        const scale = clampNumber(parseFloat(scaleEl.value), 0.5, 5, 2);
+        const quality = clampNumber(parseFloat(qualityEl.value), 0.1, 1, 0.9);
+
+        try {
+          logEl.textContent = 'Loading PDF…\n';
+          statusEl.textContent = 'Loading PDF…';
+
+          const arrayBuffer = await selectedFile.arrayBuffer();
+          const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+          const pageCount = pdf.numPages;
+          progressEl.max = pageCount;
+          progressEl.value = 0;
+
+          logEl.textContent += `Pages: ${pageCount}\n`;
+          logEl.textContent += `Scale: ${scale}, Quality: ${quality}\n\n`;
+
+          const zip = new JSZip();
+
+          // Reuse one canvas to reduce memory churn
+          const canvas = document.createElement('canvas');
+          const ctx = canvas.getContext('2d', { alpha: false });
+          if (!ctx) throw new Error('Canvas 2D context not available.');
+
+          for (let pageNum = 1; pageNum <= pageCount; pageNum++) {
+            statusEl.textContent = `Rendering page ${pageNum} / ${pageCount}…`;
+            logEl.textContent += `Rendering page ${pageNum}…\n`;
+
+            const page = await pdf.getPage(pageNum);
+            const viewport = page.getViewport({ scale });
+
+            canvas.width = Math.floor(viewport.width);
+            canvas.height = Math.floor(viewport.height);
+
+            // Fill white background so transparent PDF areas become white in JPEG
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            await page.render({ canvasContext: ctx, viewport }).promise;
+
+            const blob = await canvasToJpegBlob(canvas, quality);
+
+            const filename = `page-${String(pageNum).padStart(3, '0')}.jpg`;
+            zip.file(filename, blob);
+
+            progressEl.value = pageNum;
+
+            // Yield occasionally so the UI stays responsive on big PDFs
+            if (pageNum % 5 === 0) await nextTick();
+          }
+
+          statusEl.textContent = 'Creating ZIP…';
+          logEl.textContent += '\nCreating ZIP…\n';
+
+          const zipBlob = await zip.generateAsync({ type: 'blob' });
+
+          const baseName = selectedFile.name.replace(/\.pdf$/i, '') || 'pdf';
+          const outName = `${baseName}-pages.zip`;
+
+          saveAs(zipBlob, outName);
+
+          statusEl.textContent = 'Done ✅';
+          logEl.textContent += `Done. Downloaded: ${outName}\n`;
+        } catch (err) {
+          console.error(err);
+          statusEl.textContent = 'Error ❌';
+          logEl.textContent += `\nERROR: ${err && err.message ? err.message : String(err)}\n`;
+        } finally {
+          convertBtn.disabled = !selectedFile;
+          fileInput.disabled = false;
+          scaleEl.disabled = false;
+          qualityEl.disabled = false;
+        }
+      });
+
+      function canvasToJpegBlob(canvas, quality) {
+        return new Promise((resolve, reject) => {
+          canvas.toBlob(
+            (blob) =>
+              blob
+                ? resolve(blob)
+                : reject(new Error('Failed to encode JPEG blob')),
+            'image/jpeg',
+            quality,
+          );
+        });
+      }
+
+      function nextTick() {
+        return new Promise((r) => setTimeout(r, 0));
+      }
+
+      function clampNumber(n, min, max, fallback) {
+        if (!Number.isFinite(n)) return fallback;
+        return Math.min(max, Math.max(min, n));
+      }
+
+      function maybeEnableConvert() {
+        convertBtn.disabled = !(selectedFile && depsReady);
+      }
+    </script>
+  </body>
+</html>
