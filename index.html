@@ -120,15 +120,9 @@
             throw new Error('FileSaver saveAs not available');
           }
 
+          // Prefer workerSrc-only config. Forcing workerPort from a CDN URL can
+          // hang document loading in some browser/CDN combinations.
           pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
-          try {
-            pdfjsLib.GlobalWorkerOptions.workerPort = new Worker(pdfWorkerSrc, {
-              type: 'module',
-            });
-          } catch (err) {
-            console.error('Failed to start PDF.js worker', err);
-            statusEl.textContent = 'PDF worker failed to start';
-          }
 
           depsReady = true;
           statusEl.textContent = 'Libraries loaded. Choose a PDF…';
@@ -175,7 +169,17 @@
           statusEl.textContent = 'Loading PDF…';
 
           const arrayBuffer = await selectedFile.arrayBuffer();
-          const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+          const pdfData = new Uint8Array(arrayBuffer);
+          let pdf;
+          try {
+            pdf = await loadPdfDocument({ data: pdfData }, 20000);
+          } catch (workerErr) {
+            console.warn('PDF worker load failed, retrying without worker', workerErr);
+            logEl.textContent +=
+              'PDF worker stalled/failed. Retrying in compatibility mode…\n';
+            statusEl.textContent = 'Retrying without worker…';
+            pdf = await loadPdfDocument({ data: pdfData, disableWorker: true }, 20000);
+          }
 
           const pageCount = pdf.numPages;
           progressEl.max = pageCount;
@@ -257,6 +261,26 @@
 
       function nextTick() {
         return new Promise((r) => setTimeout(r, 0));
+      }
+
+      async function loadPdfDocument(options, timeoutMs) {
+        const loadingTask = pdfjsLib.getDocument(options);
+        let timeoutId;
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            try {
+              loadingTask.destroy();
+            } catch (err) {
+              console.warn('Failed to destroy stalled PDF loading task', err);
+            }
+            reject(new Error(`Timed out loading PDF after ${timeoutMs}ms`));
+          }, timeoutMs);
+        });
+        try {
+          return await Promise.race([loadingTask.promise, timeoutPromise]);
+        } finally {
+          clearTimeout(timeoutId);
+        }
       }
 
       function clampNumber(n, min, max, fallback) {
